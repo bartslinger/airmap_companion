@@ -3,6 +3,7 @@
 import asyncio
 
 import pymavlink.mavutil as mavutil
+import pymavlink.dialects.v20.common as mavlink
 import sys
 import time
 
@@ -21,6 +22,26 @@ mav.wait_heartbeat()
 #print("Got first heartbeat")
 loop = asyncio.get_event_loop()
 
+class Vehicle:
+    def __init__(self):
+        self.state = 'idle'
+        self.armed = False
+
+    def parse_heartbeat(self, msg):
+        armed = (msg.base_mode & mavlink.MAV_MODE_FLAG_SAFETY_ARMED) > 0
+        if armed != self.armed:
+            self.armed = armed
+            if armed:
+                print("ARMED")
+            else:
+                print("DISARMED")
+                # register flight end with airmap
+
+    def set_state(self, new_state):
+        self.state = new_state
+
+vehicle = Vehicle()
+
 async def pingloop():
     while (True):
         mav.mav.heartbeat_send(18, 0, 0, 0, 4)
@@ -36,10 +57,15 @@ async def handle_arm_request():
 async def receive_command_long():
     global arming_requested
     while True:
-        msg = mav.recv_match(type="COMMAND_LONG")
+        msg = mav.recv_match(type=['COMMAND_LONG','SYS_STATUS','HEARTBEAT'])
         if msg != None:
-            if msg.command == 3001:
+            if msg.name == 'COMMAND_LONG' and msg.command == 3001:
                 loop.create_task(handle_arm_request())
+            elif msg.name == 'SYS_STATUS':
+                pass
+                #print(msg)
+            elif msg.name == 'HEARTBEAT':
+                vehicle.parse_heartbeat(msg)
         await asyncio.sleep(0.1)
 
 async def main():
