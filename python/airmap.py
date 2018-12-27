@@ -5,6 +5,18 @@ import requests
 import json
 import datetime
 import geojson
+import time
+
+import base64
+import socket
+import struct
+from Crypto import Random
+from Crypto.Cipher import AES
+
+# generated file
+import telemetry_pb2
+
+import simulator
 
 class AirmapFlightplan:
 
@@ -26,6 +38,8 @@ class Airmap:
         self.load_config(config)
         self.pilot = None
         self.flightplan = None
+        self.flight = None
+        self.comm = None
 
     def load_config(self, config=''):
         if config == '':
@@ -113,17 +127,63 @@ class Airmap:
         reply = requests.post(url, headers=headers, json=data)
         if reply.json()["status"] == "success":
             print(reply.json())
+            self.flight = reply.json()["data"]
             pass
         else:
             print("error:")
             print(reply.json())
  
+    def end_flight(self):
+        url = "https://api.airmap.com/flight/v2/" + self.flight['flight_id'] + "/end"
+        headers = {
+                "Authorization": "Bearer " + self.token,
+                "X-API-Key": self.config['credentials']['api-key']
+                }
+        reply = requests.post(url, headers=headers)
+        if reply.json()["status"] == "success":
+            print(reply.json())
+        else:
+            print("error:")
+            print(reply.json())
+        
+    def start_comm(self):
+        url = "https://api.airmap.com/flight/v2/" + self.flight['flight_id'] + "/start-comm"
+        headers = {
+                "Authorization": "Bearer " + self.token,
+                "X-API-Key": self.config['credentials']['api-key']
+                }
+        reply = requests.post(url, headers=headers)
+        if reply.json()["status"] == "success":
+            self.comm = reply.json()["data"]
+            print("comm started", self.comm["key"])
+        else:
+            print("error:")
+            print(reply.json())
+
+    def end_comm(self):
+        url = "https://api.airmap.com/flight/v2/" + self.flight['flight_id'] + "/end-comm"
+        headers = {
+                "Authorization": "Bearer " + self.token,
+                "X-API-Key": self.config['credentials']['api-key']
+                }
+        reply = requests.post(url, headers=headers)
+        if reply.json()["status"] == "success":
+            self.comm = reply.json()["data"]
+        else:
+            print("error:")
+            print(reply.json())
+
+
         
 if __name__ == "__main__":
     airmap = Airmap()
     airmap.login()
     airmap.get_pilot()
 
+    sim = simulator.Simulator()
+
+    if 1:
+        # submit flightplan
     flightplan = AirmapFlightplan()
     latitude = 52.168014
     longitude = 4.412414
@@ -142,3 +202,97 @@ if __name__ == "__main__":
     airmap.create_flightplan(flightplan)
     
     airmap.submit_flight()
+        airmap.start_comm()
+
+        secretKey = base64.b64decode(airmap.comm["key"])
+        flightID = airmap.flight['flight_id']
+        print("secret key:", secretKey)
+
+        position = telemetry_pb2.Position()
+        attitude = telemetry_pb2.Attitude()
+        speed    = telemetry_pb2.Speed()
+        barometer = telemetry_pb2.Barometer()
+
+        HOSTNAME = 'api.k8s.stage.airmap.com'
+        IPADDR = socket.gethostbyname(HOSTNAME)
+        PORTNUM = 32003
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+
+        sock.connect((IPADDR, PORTNUM))
+        
+        counter = 1
+        for i in range(200):
+            timestamp = sim.getTimestamp()
+            position.timestamp = timestamp
+            position.latitude               = sim.getLattitude()
+            position.longitude              = sim.getLongtitude()
+            position.altitude_agl           = sim.getAgl()
+            position.altitude_msl           = sim.getMsl()
+            position.horizontal_accuracy    = sim.getHorizAccuracy()
+
+            attitude.timestamp              = timestamp
+            attitude.yaw                    = sim.getYaw()
+            attitude.pitch                  = sim.getPitch()
+            attitude.roll                   = sim.getRoll()
+
+            speed.timestamp                 = timestamp
+            speed.velocity_x                = sim.getVelocityX()
+            speed.velocity_y                = sim.getVelocityY()
+            speed.velocity_z                = sim.getVelocityZ()
+
+            barometer.timestamp             = timestamp
+            barometer.pressure              = sim.getPressure()
+
+            # build  payload
+
+            # serialize  protobuf messages to string and pack to payload buffer
+            bytestring = position.SerializeToString()
+            fmt = '!HH'+str(len(bytestring))+'s'
+            payload = struct.pack(fmt, 1, len(bytestring), bytestring)
+
+            # bytestring = attitude.SerializeToString()
+            # fmt = '!HH'+str(len(bytestring))+'s'
+            # payload += struct.pack(fmt, 2, len(bytestring), bytestring)
+
+            # bytestring = speed.SerializeToString()
+            # fmt = '!HH'+str(len(bytestring))+'s'
+            # payload += struct.pack(fmt, 3, len(bytestring), bytestring)
+
+            # bytestring = barometer.SerializeToString()
+            # fmt = '!HH'+str(len(bytestring))+'s'
+            # payload += struct.pack(fmt, 4, len(bytestring), bytestring)
+    
+            # encrypt payload
+
+            # use PKCS7 padding with block size 16
+            BS = 16
+            pad = lambda s: s + bytes((BS - len(s) % BS) * chr(BS - len(s) % BS), 'utf-8')
+            payload = pad(payload)
+            IV = Random.new().read(16)
+            aes = AES.new(secretKey, AES.MODE_CBC, IV)
+            encryptedPayload = aes.encrypt(payload)
+
+            # send telemetry
+
+            # packed data content of the UDP packet
+            fmt = '!LB'+str(len(flightID))+'sB16s'+str(len(encryptedPayload))+'s'
+            PACKETDATA = struct.pack(fmt, counter, len(flightID), bytes(flightID, 'utf-8'), 1, IV, encryptedPayload)
+
+            print(position.latitude, position.longitude)
+            # send the payload
+            sock.send(PACKETDATA)
+
+            # print timestamp when payload was sent
+            print("Sent payload messsage #" , counter ,  "@" , time.strftime("%H:%M:%S"))
+            
+            # increment sequence number
+            counter += 1
+
+            # 5 Hz
+            time.sleep(0.2)
+
+        sock.close()
+
+        airmap.end_comm()
+        airmap.end_flight()

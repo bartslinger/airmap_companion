@@ -55,7 +55,6 @@ async def handle_arm_request():
     print("Airmap request approved")
 
 async def receive_command_long():
-    global arming_requested
     while True:
         msg = mav.recv_match(type=['COMMAND_LONG','SYS_STATUS','HEARTBEAT'])
         if msg != None:
