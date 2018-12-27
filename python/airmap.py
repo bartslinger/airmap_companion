@@ -80,13 +80,14 @@ class Airmap:
             print("error:")
             print(reply.json())
 
-    def refresh_token():
-        url = "https://" + self.config['sso']['host'] + "/delegation"
-        payload = {
-                'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-                'client_id': self.config['credentials']['oauth']['client-id'],
-                'refresh_token': ''}
+    def refresh_token(self):
+        #url = "https://" + self.config['sso']['host'] + "/delegation"
+        #payload = {
+        #        'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        #        'client_id': self.config['credentials']['oauth']['client-id'],
+        #        'refresh_token': ''}
         # not finished yet
+        pass
 
     def create_flightplan(self, flightplan):
         url = "https://api.airmap.com/flight/v2/plan"
@@ -173,6 +174,68 @@ class Airmap:
             print("error:")
             print(reply.json())
 
+class AirmapTelemetry:
+
+    def __init__(self, flight_id, comm_key):
+        self.config = None
+        self.load_config()
+        self.flight_id = flight_id
+        self.secret_key = base64.b64decode(comm_key)
+
+        self.position = telemetry_pb2.Position()
+
+    def get_timestamp(self):
+        d = datetime.datetime.now()
+        return int(d.microsecond/1000 + time.mktime(d.timetuple())*1000)
+
+    def start(self):
+        HOSTNAME = self.config['telemetry']['host']
+        IPADDR = socket.gethostbyname(HOSTNAME)
+        PORTNUM = self.config['telemetry']['port']
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+        self.sock.connect((IPADDR, PORTNUM))
+
+    def update_position(self, lat, lon, agl, msl, hacc):
+        self.position.timestamp = self.get_timestamp()
+        self.position.latitude = lat
+        self.position.longitude = lon
+        self.position.altitude_agl = agl
+        self.position.altitude_msl = msl
+        self.position.horizontal_accuracy = hacc
+
+    def send_update(self):
+        # serialize  protobuf messages to string and pack to payload buffer
+        bytestring = self.position.SerializeToString()
+        fmt = '!HH'+str(len(bytestring))+'s'
+        payload = struct.pack(fmt, 1, len(bytestring), bytestring)
+        
+        # encrypt payload
+        # use PKCS7 padding with block size 16
+        BS = 16
+        pad = lambda s: s + bytes((BS - len(s) % BS) * chr(BS - len(s) % BS), 'utf-8')
+        payload = pad(payload)
+        IV = Random.new().read(16)
+        aes = AES.new(self.secret_key, AES.MODE_CBC, IV)
+        encryptedPayload = aes.encrypt(payload)
+
+        # send telemetry
+        # packed data content of the UDP packet
+        fmt = '!LB'+str(len(self.flight_id))+'sB16s'+str(len(encryptedPayload))+'s'
+        PACKETDATA = struct.pack(fmt, counter, len(self.flight_id), bytes(self.flight_id, 'utf-8'), 1, IV, encryptedPayload)
+
+        #print(position.latitude, position.longitude)
+        # send the payload
+        self.sock.send(PACKETDATA)
+
+    def load_config(self, config=''):
+        if config == '':
+            config = pathlib.Path.home() / '.config/airmap/production/config.json'
+        try:
+            config_fp = open(config)
+        except:
+            print("could not open config file")
+
+        self.config = json.load(config_fp)
 
         
 if __name__ == "__main__":
@@ -181,107 +244,37 @@ if __name__ == "__main__":
     airmap.get_pilot()
 
     sim = simulator.Simulator()
-
     if 1:
         # submit flightplan
-    flightplan = AirmapFlightplan()
-    latitude = 52.168014
-    longitude = 4.412414
-    flightplan.takeoff_latitude = str(latitude)
-    flightplan.takeoff_longitude = str(longitude)
 
-    p = geojson.Point((longitude, latitude))
-    flightplan.geometry = geojson.Point((longitude, latitude))
+        flightplan = AirmapFlightplan()
+        latitude = 52.168014
+        longitude = 4.412414
+        flightplan.takeoff_latitude = str(latitude)
+        flightplan.takeoff_longitude = str(longitude)
 
-    flightplan.max_altitude_agl = 50.
-    flightplan.pilot_id = airmap.pilot['id']
-    now = datetime.datetime.now(datetime.timezone.utc)
-    flightplan.start_time = now.isoformat()
-    flight_time = datetime.timedelta(minutes=20)
-    flightplan.end_time = (now + flight_time).isoformat() 
-    airmap.create_flightplan(flightplan)
-    
-    airmap.submit_flight()
+        p = geojson.Point((longitude, latitude))
+        flightplan.geometry = geojson.Point((longitude, latitude))
+
+        flightplan.max_altitude_agl = 50.
+        flightplan.pilot_id = airmap.pilot['id']
+        now = datetime.datetime.now(datetime.timezone.utc)
+        flightplan.start_time = now.isoformat()
+        flight_time = datetime.timedelta(minutes=20)
+        flightplan.end_time = (now + flight_time).isoformat() 
+        airmap.create_flightplan(flightplan)
+        
+        airmap.submit_flight()
         airmap.start_comm()
 
-        secretKey = base64.b64decode(airmap.comm["key"])
-        flightID = airmap.flight['flight_id']
-        print("secret key:", secretKey)
-
-        position = telemetry_pb2.Position()
-        attitude = telemetry_pb2.Attitude()
-        speed    = telemetry_pb2.Speed()
-        barometer = telemetry_pb2.Barometer()
-
-        HOSTNAME = 'api.k8s.stage.airmap.com'
-        IPADDR = socket.gethostbyname(HOSTNAME)
-        PORTNUM = 32003
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
-
-        sock.connect((IPADDR, PORTNUM))
+        telem = AirmapTelemetry(airmap.flight['flight_id'], airmap.comm['key'])
+        telem.start()
         
         counter = 1
         for i in range(200):
-            timestamp = sim.getTimestamp()
-            position.timestamp = timestamp
-            position.latitude               = sim.getLattitude()
-            position.longitude              = sim.getLongtitude()
-            position.altitude_agl           = sim.getAgl()
-            position.altitude_msl           = sim.getMsl()
-            position.horizontal_accuracy    = sim.getHorizAccuracy()
 
-            attitude.timestamp              = timestamp
-            attitude.yaw                    = sim.getYaw()
-            attitude.pitch                  = sim.getPitch()
-            attitude.roll                   = sim.getRoll()
-
-            speed.timestamp                 = timestamp
-            speed.velocity_x                = sim.getVelocityX()
-            speed.velocity_y                = sim.getVelocityY()
-            speed.velocity_z                = sim.getVelocityZ()
-
-            barometer.timestamp             = timestamp
-            barometer.pressure              = sim.getPressure()
-
-            # build  payload
-
-            # serialize  protobuf messages to string and pack to payload buffer
-            bytestring = position.SerializeToString()
-            fmt = '!HH'+str(len(bytestring))+'s'
-            payload = struct.pack(fmt, 1, len(bytestring), bytestring)
-
-            # bytestring = attitude.SerializeToString()
-            # fmt = '!HH'+str(len(bytestring))+'s'
-            # payload += struct.pack(fmt, 2, len(bytestring), bytestring)
-
-            # bytestring = speed.SerializeToString()
-            # fmt = '!HH'+str(len(bytestring))+'s'
-            # payload += struct.pack(fmt, 3, len(bytestring), bytestring)
-
-            # bytestring = barometer.SerializeToString()
-            # fmt = '!HH'+str(len(bytestring))+'s'
-            # payload += struct.pack(fmt, 4, len(bytestring), bytestring)
-    
-            # encrypt payload
-
-            # use PKCS7 padding with block size 16
-            BS = 16
-            pad = lambda s: s + bytes((BS - len(s) % BS) * chr(BS - len(s) % BS), 'utf-8')
-            payload = pad(payload)
-            IV = Random.new().read(16)
-            aes = AES.new(secretKey, AES.MODE_CBC, IV)
-            encryptedPayload = aes.encrypt(payload)
-
-            # send telemetry
-
-            # packed data content of the UDP packet
-            fmt = '!LB'+str(len(flightID))+'sB16s'+str(len(encryptedPayload))+'s'
-            PACKETDATA = struct.pack(fmt, counter, len(flightID), bytes(flightID, 'utf-8'), 1, IV, encryptedPayload)
-
-            print(position.latitude, position.longitude)
-            # send the payload
-            sock.send(PACKETDATA)
+            telem.update_position(sim.getLattitude(), sim.getLongtitude(), sim.getAgl(), sim.getMsl(), sim.getHorizAccuracy())
+            telem.send_update()
 
             # print timestamp when payload was sent
             print("Sent payload messsage #" , counter ,  "@" , time.strftime("%H:%M:%S"))
@@ -291,8 +284,6 @@ if __name__ == "__main__":
 
             # 5 Hz
             time.sleep(0.2)
-
-        sock.close()
 
         airmap.end_comm()
         airmap.end_flight()
