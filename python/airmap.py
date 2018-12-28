@@ -146,6 +146,7 @@ class Airmap:
         else:
             print("error:")
             print(reply.json())
+        self.flight = None
         
     def start_comm(self):
         url = "https://api.airmap.com/flight/v2/" + self.flight['flight_id'] + "/start-comm"
@@ -176,19 +177,27 @@ class Airmap:
 
 class AirmapTelemetry:
 
-    def __init__(self, flight_id, comm_key):
+    def __init__(self):
         self.config = None
+        self.flight_id = None
+        self.secret_key = None
         self.load_config()
-        self.flight_id = flight_id
-        self.secret_key = base64.b64decode(comm_key)
-
         self.position = telemetry_pb2.Position()
+        self.sock = None
+        self.counter = 1
+
+    def __del__(self):
+        if self.sock != None:
+            print("closing socket")
+            self.sock.close()
 
     def get_timestamp(self):
         d = datetime.datetime.now()
         return int(d.microsecond/1000 + time.mktime(d.timetuple())*1000)
 
-    def start(self):
+    def start(self, flight_id, comm_key):
+        self.flight_id = flight_id
+        self.secret_key = base64.b64decode(comm_key)
         HOSTNAME = self.config['telemetry']['host']
         IPADDR = socket.gethostbyname(HOSTNAME)
         PORTNUM = self.config['telemetry']['port']
@@ -204,11 +213,12 @@ class AirmapTelemetry:
         self.position.horizontal_accuracy = hacc
 
     def send_update(self):
+        print("sending telemetry update %d" % self.counter)
         # serialize  protobuf messages to string and pack to payload buffer
         bytestring = self.position.SerializeToString()
         fmt = '!HH'+str(len(bytestring))+'s'
         payload = struct.pack(fmt, 1, len(bytestring), bytestring)
-        
+
         # encrypt payload
         # use PKCS7 padding with block size 16
         BS = 16
@@ -217,13 +227,12 @@ class AirmapTelemetry:
         IV = Random.new().read(16)
         aes = AES.new(self.secret_key, AES.MODE_CBC, IV)
         encryptedPayload = aes.encrypt(payload)
-
         # send telemetry
         # packed data content of the UDP packet
         fmt = '!LB'+str(len(self.flight_id))+'sB16s'+str(len(encryptedPayload))+'s'
-        PACKETDATA = struct.pack(fmt, counter, len(self.flight_id), bytes(self.flight_id, 'utf-8'), 1, IV, encryptedPayload)
+        PACKETDATA = struct.pack(fmt, self.counter, len(self.flight_id), bytes(self.flight_id, 'utf-8'), 1, IV, encryptedPayload)
+        self.counter += 1
 
-        #print(position.latitude, position.longitude)
         # send the payload
         self.sock.send(PACKETDATA)
 
@@ -267,11 +276,11 @@ if __name__ == "__main__":
         airmap.submit_flight()
         airmap.start_comm()
 
-        telem = AirmapTelemetry(airmap.flight['flight_id'], airmap.comm['key'])
-        telem.start()
+        telem = AirmapTelemetry()
+        telem.start(airmap.flight['flight_id'], airmap.comm['key'])
         
         counter = 1
-        for i in range(200):
+        for i in range(20):
 
             telem.update_position(sim.getLattitude(), sim.getLongtitude(), sim.getAgl(), sim.getMsl(), sim.getHorizAccuracy())
             telem.send_update()
